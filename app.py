@@ -30,7 +30,7 @@ def fetch_html_text(url: str) -> str:
         "User-Agent": "Mozilla/5.0",
         "Accept-Language": "ko-KR,ko;q=0.9",
     }
-    # connect/read 타임아웃 분리 권장
+    # connect/read 타임아웃 분리
     r = requests.get(url, headers=headers, timeout=(3, 10))
     r.raise_for_status()
 
@@ -102,7 +102,6 @@ def parse_page_a(y: int, m: int, d: int) -> Dict[str, List[str]]:
 # =========================
 BASE_URL_B = "https://pot.knue.ac.kr/enview/knue/mobileMenu.html"
 
-# 요청 요일 -> DOM id 매핑 (스크린샷 기준)
 DAY_TO_DIV_ID = {
     "mon": "mon_list",
     "tue": "tue_list",
@@ -113,7 +112,6 @@ DAY_TO_DIV_ID = {
     "sun": "sun_list",
 }
 
-# B는 <th scope="row">아침</th> ... 구조
 B_MEAL_KEYS = ("아침", "점심", "저녁")
 
 
@@ -158,6 +156,44 @@ def parse_b_date_from_h3(h3_text: str) -> Optional[str]:
     return f"{yy:04d}-{mm:02d}-{dd:02d}"
 
 
+# ---- (추가) B에서 첫 줄(시간/안내 등) 제거용 ----
+_TIME_RANGE_RE = re.compile(
+    r"""^\s*
+        [\[\(]?\s*
+        \d{1,2}\s*:\s*\d{2}
+        \s*~\s*
+        \d{1,2}\s*:\s*\d{2}
+        \s*[\]\)]?
+        \s*$""",
+    re.VERBOSE,
+)
+
+
+def drop_meaningless_first_line(lines: List[str]) -> List[str]:
+    """
+    B 파싱 결과에서 첫 줄이 '시간대/안내' 같이 의미 없는 데이터면 제거.
+    예) [11:00~14:00], 11:00~14:00, (11:00~14:00)
+    """
+    if not lines:
+        return lines
+
+    first = lines[0]
+    if _TIME_RANGE_RE.match(first):
+        return lines[1:]
+
+    return lines
+
+
+def find_table_after_h3(h3_node):
+    """
+    '교직원 식당' h3 기준으로 가장 가까운 table(tbl_4 우선)를 선택
+    """
+    tables = h3_node.xpath('following::table[contains(@class,"tbl_4")][1]')
+    if not tables:
+        tables = h3_node.xpath("following::table[1]")
+    return tables[0] if tables else None
+
+
 def parse_page_b(day: str) -> Tuple[Optional[str], Dict[str, List[str]]]:
     """
     day: mon|tue|... 로 요청받고,
@@ -166,7 +202,7 @@ def parse_page_b(day: str) -> Tuple[Optional[str], Dict[str, List[str]]]:
     if day not in DAY_TO_DIV_ID:
         raise ValueError("day must be one of: mon, tue, wed, thu, fri, sat, sun")
 
-    html_text = fetch_html_text(BASE_URL_B)  # B는 보통 UTF-8이지만 fetch_html_text가 폴백도 처리
+    html_text = fetch_html_text(BASE_URL_B)
     tree = html.fromstring(html_text)
 
     div_id = DAY_TO_DIV_ID[day]
@@ -180,22 +216,16 @@ def parse_page_b(day: str) -> Tuple[Optional[str], Dict[str, List[str]]]:
     # 2) '교직원 식당' h3 찾기
     h3_nodes = day_div.xpath('.//h3[contains(normalize-space(.), "교직원") and contains(normalize-space(.), "식당")]')
     if not h3_nodes:
-        # 페이지 구조 변경 가능성
         raise RuntimeError("Cannot find '교직원 식당' section (h3).")
 
-    h3_text = normalize_space(h3_nodes[0].text_content())
+    h3 = h3_nodes[0]
+    h3_text = normalize_space(h3.text_content())
     parsed_date = parse_b_date_from_h3(h3_text)
 
-    # 3) h3 아래(같은 div 내부)에서 첫 번째 table(tbl_4)을 우선 사용
-    #    (스크린샷 기준: <table class="tbl_4">)
-    tables = day_div.xpath('.//table[contains(@class,"tbl_4")]')
-    if not tables:
-        # table class가 바뀌면 여기서 대응 필요
-        tables = day_div.xpath(".//table")
-    if not tables:
-        raise RuntimeError("Cannot find menu table in the '교직원 식당' section.")
-
-    table = tables[0]
+    # 3) h3 이후 가장 가까운 table 사용 (교직원 식당 섹션과 테이블 매칭 강화)
+    table = find_table_after_h3(h3)
+    if table is None:
+        raise RuntimeError("Cannot find menu table following the '교직원 식당' h3.")
 
     # 4) 행 파싱: <tr><th scope="row">점심</th><td>...</td></tr>
     out: Dict[str, List[str]] = {k: [] for k in B_MEAL_KEYS}
@@ -211,10 +241,11 @@ def parse_page_b(day: str) -> Tuple[Optional[str], Dict[str, List[str]]]:
             continue
 
         td_text = extract_text_preserve_br(tds[0])
-        # td_text는 "[11:00~14:00] ... \n ..." 형태가 될 수 있음
         lines = [line.strip() for line in td_text.split("\n") if line.strip()]
 
-        # 빈 칸(<td></td>)이면 빈 리스트 유지
+        # ---- (핵심) 첫 번째 줄이 의미 없는 시간/안내면 제거 ----
+        lines = drop_meaningless_first_line(lines)
+
         out[key] = lines
 
     return parsed_date, out
